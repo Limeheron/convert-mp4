@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# 입력 파일 체크
+if [ -z "$1" ]; then
+    echo "사용법: $0 [파일경로]"
+    exit 1
+fi
+
+input="$1"
+dir=$(dirname "$input")
+filename=$(basename "$input")
+name="${filename%.*}"
+
+# 기본 출력 파일명 지정 (.mp4)
+output="$dir/$name.mp4"
+
+# 동일한 파일명이 존재할 경우 _1, _2 ... 붙이기
+counter=1
+while [ -e "$output" ]; do
+    echo "⚠️ 경고: '$output' 파일이 이미 존재합니다."
+    output="$dir/${name}_${counter}.mp4"
+    ((counter++))
+done
+
+echo "▶ 변환 시작: $input -> $output"
+
+# 메타데이터 교정 무손실 변환 실행
+ffmpeg -i "$input" -c copy -fflags +genpts+igndts -avoid_negative_ts make_zero -fps_mode cfr "$output"
+
+echo "✅ 변환 완료: $output"
