@@ -50,13 +50,13 @@ unique_path() {
     echo "$path"
 }
 
-# 스트림 목록을 "번호|종류|코덱|커버여부|언어|첨부파일명" 줄로 출력한다.
+# 스트림 목록을 "번호|종류|코덱|커버여부|언어|코덱태그|첨부파일명" 줄로 출력한다.
 # flat 형식을 쓰는 이유: MPEG-TS는 같은 스트림이 프로그램 항목에도 한 번 더 나오는데,
 # flat 형식에서만 실제 스트림 항목(streams.stream.N.*)을 확실히 구분할 수 있다.
 probe_streams() {
     local raw
     raw=$(ffprobe -v error \
-        -show_entries stream=index,codec_type,codec_name:stream_disposition=attached_pic:stream_tags=language,filename \
+        -show_entries stream=index,codec_type,codec_name,codec_tag_string:stream_disposition=attached_pic:stream_tags=language,filename \
         -of flat "file:$1") || return 1
     awk '
         /^streams\.stream\.[0-9]+\./ {
@@ -71,8 +71,9 @@ probe_streams() {
             if (!count) exit 1
             for (i = 1; i <= count; i++) {
                 n = order[i]
-                printf "%s|%s|%s|%s|%s|%s\n", field[n, "index"], field[n, "codec_type"], field[n, "codec_name"],
-                    field[n, "disposition.attached_pic"], field[n, "tags.language"], field[n, "tags.filename"]
+                printf "%s|%s|%s|%s|%s|%s|%s\n", field[n, "index"], field[n, "codec_type"], field[n, "codec_name"],
+                    field[n, "disposition.attached_pic"], field[n, "tags.language"], field[n, "codec_tag_string"],
+                    field[n, "tags.filename"]
             }
         }' <<< "$raw"
 }
@@ -144,7 +145,7 @@ copy_file_info() {   # 원본 대상
     done
     # 수정일을 생성일보다 과거로 설정하면 macOS가 생성일도 그 시각으로 당긴다.
     # 그래서 원본 생성일 → 원본 수정일 순서로 두 번 설정한다.
-    birth=$(/usr/bin/stat -f %B "$src")
+    birth=$(/usr/bin/stat -L -f %B "$src")   # -L: 심볼릭 링크면 대상 파일 기준
     if [ "${birth:-0}" -gt 0 ]; then
         TZ=UTC0 /usr/bin/touch -t "$(TZ=UTC0 /bin/date -r "$birth" +%Y%m%d%H%M.%S)" "$dst"
     fi
@@ -193,9 +194,9 @@ convert_one() {
     local chapters
     chapters=$(ffprobe -v error -show_entries chapter=id -of csv=p=0 "file:$in" | grep -c .)
 
-    local maps=() covers=() hvc1=() src_va=() src_covers=() subs=() excluded=()
-    local idx kind codec pic lang fname label note item n=0 warned=0
-    while IFS='|' read -r idx kind codec pic lang fname; do
+    local maps=() covers=() hvc1=() src_va=() src_covers=() subs=() excluded=() attachments=()
+    local idx kind codec pic lang tag fname label note item first_attachment n=0 warned=0
+    while IFS='|' read -r idx kind codec pic lang tag fname; do
         case "$kind:$pic" in
             video:1)                                   # MKV에 첨부된 커버 이미지
                 case "$codec" in
@@ -231,14 +232,26 @@ convert_one() {
                     *)  excluded+=("자막 #$idx ($codec)") ;;
                 esac
                 ;;
-            attachment:*) excluded+=("첨부 파일 #$idx${fname:+ ($fname)}") ;;
+            attachment:*)
+                [ ${#attachments[@]} -eq 0 ] && first_attachment=${fname:-#$idx}
+                attachments+=("#$idx${fname:+ ($fname)}") ;;
             data:*)
                 # MP4/MOV 입력의 챕터 트랙(텍스트)이면 알리지 않는다. 챕터는 -map_chapters 로 옮겨진다.
-                [ "$codec" = bin_data ] && [ "$chapters" -gt 0 ] && continue
+                # 다른 데이터 트랙(GoPro 텔레메트리 등)과 구분하려고 코덱 태그까지 확인한다.
+                case "$codec:$tag" in
+                    bin_data:text|bin_data:tx3g) [ "$chapters" -gt 0 ] && continue ;;
+                esac
                 excluded+=("데이터 트랙 #$idx${codec:+ ($codec)}") ;;
             *)            excluded+=("$kind 트랙 #$idx${codec:+ ($codec)}") ;;
         esac
     done <<< "$streams"
+
+    # 첨부 파일(주로 ASS 자막용 글꼴)은 여러 개면 한 줄로 묶어 알린다
+    if [ ${#attachments[@]} -eq 1 ]; then
+        excluded+=("첨부 파일 ${attachments[0]}")
+    elif [ ${#attachments[@]} -gt 1 ]; then
+        excluded+=("첨부 파일 ${#attachments[@]}개 ($first_attachment 등)")
+    fi
 
     for item in "${excluded[@]}"; do
         echo "   ⏭  $item: MP4에 넣을 수 없어 제외 (원본에는 그대로 있음)"
@@ -294,7 +307,7 @@ convert_one() {
     # --- 검증 ---
     echo "🔍 검증: 원본과 결과물의 트랙 데이터를 비교합니다..."
     local dst_va=() dst_covers=()
-    while IFS='|' read -r idx kind codec pic lang fname; do
+    while IFS='|' read -r idx kind codec pic lang tag fname; do
         case "$kind:$pic" in
             video:1)         dst_covers+=("$idx") ;;
             video:*|audio:*) dst_va+=("$idx") ;;
